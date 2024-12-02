@@ -1,13 +1,12 @@
 import os
 import sys
-import wandb
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import uuid
 import glob
 import time
 from dataclasses import dataclass
-import math
+
 import numpy as np
 import torch
 from torch import nn
@@ -18,37 +17,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
-#needing this for my fp16
-def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
-        is_causal=False, scale=None, enable_gqa=False) -> torch.Tensor:
-    L, S = query.size(-2), key.size(-2)
-    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
-    
-    # Create attn_bias on the same device as query
-    attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
-    
-    if is_causal:
-        assert attn_mask is None
-        # Create mask on the same device as query
-        temp_mask = torch.ones(L, S, dtype=torch.bool, device=query.device).tril(diagonal=0)
-        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
-        attn_bias = attn_bias.to(query.dtype)
 
-    if attn_mask is not None:
-        if attn_mask.dtype == torch.bool:
-            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
-        else:
-            attn_bias += attn_mask
-
-    if enable_gqa:
-        key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
-        value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
-
-    attn_weight = query @ key.transpose(-2, -1) * scale_factor
-    attn_weight += attn_bias
-    attn_weight = torch.softmax(attn_weight, dim=-1)
-    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
-    return attn_weight @ value
 def zeropower_via_svd(G, steps=None):
     U, S, V = G.svd()
     return U @ V.T
@@ -66,7 +35,7 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     """
     assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750,  2.0315)
-    X = G.to(torch.float16)
+    X = G.bfloat16()
     X /= (X.norm() + eps) # ensure top singular value <= 1
     if G.size(0) > G.size(1):
         X = X.T
@@ -170,8 +139,8 @@ class Rotary(torch.nn.Module):
             self.seq_len_cached = seq_len
             t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
             freqs = torch.outer(t, self.inv_freq)
-            self.cos_cached = freqs.cos().to(torch.float16)
-            self.sin_cached = freqs.sin().to(torch.float16)
+            self.cos_cached = freqs.cos().bfloat16()
+            self.sin_cached = freqs.sin().bfloat16()
         return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
 
 def apply_rotary_emb(x, cos, sin):
@@ -215,27 +184,7 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(q)
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        y = scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
-
-        '''
-        # Replace scaled_dot_product_attention with manual implementation
-        scale = 1.0 / math.sqrt(self.head_dim)
-        q = q.transpose(1, 2)  # (B, nh, T, hs)
-        k = k.transpose(1, 2)  # (B, nh, T, hs)
-        v = v.transpose(1, 2)  # (B, nh, T, hs)
-        
-        # compute attention scores
-        att = (q @ k.transpose(-2, -1)) * scale
-        
-        # causal mask
-        causal_mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
-        att = att.masked_fill(causal_mask, float('-inf'))
-        
-        # softmax
-        att = F.softmax(att, dim=-1)
-        
-        y = att @ v  # (B, nh, T, hs)
-   '''     
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y, v1
@@ -275,9 +224,9 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     vocab_size : int = 50304
-    n_layer : int = 6
+    n_layer : int = 12
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
-    n_embd : int = 384
+    n_embd : int = 768
 
 class GPT(nn.Module):
 
@@ -393,8 +342,8 @@ class Hyperparameters:
     input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 8#8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 8 # batch size, in sequences, per device
+    batch_size : int = 8*64 # batch size, in sequences, across all devices
+    device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 3242 # number of iterations to run
     warmup_iters : int = 0
@@ -404,11 +353,6 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-    # wandb config parameters
-    wandb_project: str = "nanogpt-training"
-    wandb_entity: str = None  # Set to your wandb username or team name
-    wandb_run_name: str = None  # Will be auto-generated if None
-    wandb_log_every: int = 1  # How often to log metrics to wandb
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -470,7 +414,7 @@ x, y = train_loader.next_batch()
 # this originates from Karpathy's experiments.
 num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
-model = model.cuda().to(torch.float16)
+model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
         m.float()
@@ -512,48 +456,29 @@ def get_lr(it):
         return decay_ratio
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
-# Initialize wandb in the master process
-if master_process:
-    wandb.init(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
-        name=args.wandb_run_name,
-        config={
-            "batch_size": args.batch_size,
-            "device_batch_size": args.device_batch_size,
-            "sequence_length": args.sequence_length,
-            "num_iterations": args.num_iterations,
-            "warmup_iters": args.warmup_iters,
-            "warmdown_iters": args.warmdown_iters,
-            "weight_decay": args.weight_decay,
-            "model_config": {
-                "vocab_size": num_vocab,
-                "n_layer": 12,
-                "n_head": 6,
-                "n_embd": 768
-            }
-        }
-    )
-
 # Start training loop
 training_time_ms = 0
+# start the clock
 torch.cuda.synchronize()
 t0 = time.time()
+# begin training
 train_loader.reset()
-
 for step in range(args.num_iterations + 1):
     last_step = (step == args.num_iterations)
-    
+    # This effectively ignores timing first 10 steps, which are slower for weird reasons.
+    # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
+    # steps with dummy data first, and then re-initialize the model and reset the loader.
     if step == 10:
         training_time_ms = 0
         t0 = time.time()
-    timed_steps = float('nan') if step <= 11 else (step - 10) + 1
+    timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-    # Validation logging
+    # once in a while evaluate the validation dataset
     if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+        # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)
-        
+        # run validation batches
         model.eval()
         val_loader.reset()
         val_loss = 0.0
@@ -563,45 +488,46 @@ for step in range(args.num_iterations + 1):
                 val_loss += model(x_val, y_val)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
-        
-        # Log validation metrics
-        if master_process:
-            wandb.log({
-                "val_loss": val_loss.item(),
-                "step": step,
-                "training_time_ms": training_time_ms,
-                "ms_per_step": training_time_ms/timed_steps if not math.isnan(timed_steps) else 0
-            })
-        
+        # log val loss to console and to logfile
         print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+        # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
 
     if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
+        # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)
         # save the state of the training process
         log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
         torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+        # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
 
+    # bit confusing: we want to make sure to eval on 0th iteration
+    # but also after the very last iteration. so we loop for step <= num_iterations
+    # instead of just < num_iterations (one extra due to <=), only to do
+    # the validation/sampling one last time, and then we break right here as we're done.
     if last_step:
         break
 
-    # Training section
+    # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
     for i in range(1, train_accumulation_steps+1):
+        # forward pass
         loss = model(x, y)
         train_loss = loss.detach()
+        # advance the dataset for the next batch
         x, y = train_loader.next_batch()
-        
+        # backward pass
         if i < train_accumulation_steps:
-            with model.no_sync():
+            with model.no_sync(): # there's no need to sync gradients every accumulation step
                 loss.backward()
         else:
-            loss.backward()
-    
+            loss.backward() # just sync on the last step
+    for p in model.parameters():
+        p.grad /= train_accumulation_steps
     # momentum warmup for Muon
     frac = min(step/500, 1)
     optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
@@ -611,25 +537,15 @@ for step in range(args.num_iterations + 1):
         sched.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
+    # --------------- TRAINING SECTION END -------------------
+    # everything that follows now is just diagnostics, prints, logging, etc.
 
-    # Log training metrics
-    if master_process and step % args.wandb_log_every == 0:
-        approx_time = training_time_ms + 1000 * (time.time() - t0)
-        wandb.log({
-            "train_loss": train_loss.item(),
-            "step": step,
-            "learning_rate": optimizers[0].param_groups[0]['lr'],
-            "approx_ms_per_step": approx_time/timed_steps if not math.isnan(timed_steps) else 0
-        })
-
+    #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
+    approx_time = training_time_ms + 1000 * (time.time() - t0)
     print0(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
-
-# Finish wandb logging
-if master_process:
-    wandb.finish()
 
 # -------------------------------------------------------------------------
 # clean up nice

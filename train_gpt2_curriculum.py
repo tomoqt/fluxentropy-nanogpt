@@ -275,9 +275,9 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     vocab_size : int = 50304
-    n_layer : int = 6
-    n_head : int = 6 # head dim 128 suggested by @Grad62304977
-    n_embd : int = 384
+    n_layer : int = 2
+    n_head : int = 2 # head dim 128 suggested by @Grad62304977
+    n_embd : int = 128
 
 class GPT(nn.Module):
 
@@ -340,11 +340,12 @@ def _load_data_shard(filename):
     return tokens
 
 class DistributedDataLoader:
-    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
+    def __init__(self, filename_pattern, B, T, process_rank, num_processes, num_bins=None, schedule_func=None, test_mode=False):
         self.process_rank = process_rank
         self.num_processes = num_processes
         self.B = B
         self.T = T
+        self.test_mode = test_mode
 
         # glob files that match the pattern
         self.files = sorted(glob.glob(filename_pattern))
@@ -352,29 +353,109 @@ class DistributedDataLoader:
 
         # load and validate all data shards, count number of tokens in total
         ntok_total = 0
+        self.shard_ntoks = []
         for fname in self.files:
             shard_ntok = _peek_data_shard(fname)
             assert shard_ntok >= num_processes * B * T + 1
             ntok_total += int(shard_ntok)
+            self.shard_ntoks.append(shard_ntok)
         self.ntok_total = ntok_total
+
+        # Assign files to bins
+        self.num_bins = num_bins
+        self.schedule_func = schedule_func
+        if self.num_bins is not None and self.schedule_func is not None:
+            num_files = len(self.files)
+            if self.test_mode:
+                # Randomly assign files to bins
+                import random
+                random.shuffle(self.files)
+                bin_sizes = [num_files // self.num_bins] * self.num_bins
+                for i in range(num_files % self.num_bins):
+                    bin_sizes[i] += 1
+                self.bin_files = []
+                idx = 0
+                for size in bin_sizes:
+                    bin_files = self.files[idx:idx+size]
+                    self.bin_files.append(bin_files)
+                    idx += size
+                # Sanity check: print bin assignments
+                print(f"Process {process_rank}: Assigned files randomly to bins (Test Mode)")
+                for i, bin_files in enumerate(self.bin_files):
+                    print(f"Process {process_rank}: Bin {i}, files: {bin_files}")
+            else:
+                # Assume files are sorted by entropy and assign accordingly
+                files_per_bin = num_files // self.num_bins
+                extra_files = num_files % self.num_bins
+                self.bin_files = []
+                start_idx = 0
+                for i in range(self.num_bins):
+                    end_idx = start_idx + files_per_bin
+                    if extra_files > 0:
+                        end_idx += 1
+                        extra_files -= 1
+                    bin_files = self.files[start_idx:end_idx]
+                    self.bin_files.append(bin_files)
+                    start_idx = end_idx
+                # Sanity check: print bin assignments
+                print(f"Process {process_rank}: Assigned files to bins")
+                for i, bin_files in enumerate(self.bin_files):
+                    print(f"Process {process_rank}: Bin {i}, files: {bin_files}")
+        else:
+            self.num_bins = None
 
         # kick things off
         self.reset()
 
     def reset(self):
-        self.current_shard = 0
-        self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
+        if self.num_bins is not None:
+            self.current_bin_idx = 0
+            self.current_files = self.bin_files[self.current_bin_idx]
+        else:
+            self.current_files = self.files
 
-    def advance(self): # advance to next data shard
-        self.current_shard = (self.current_shard + 1) % len(self.files)
+        self.current_shard_idx = 0
+        self.current_shard_file = self.current_files[self.current_shard_idx]
         self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
+        self.tokens = _load_data_shard(self.current_shard_file)
+        # Sanity check
+        print(f"Process {self.process_rank}: Reset loader. Current shard file: {self.current_shard_file}")
 
-    def next_batch(self):
+    def advance(self):
+        self.current_shard_idx = (self.current_shard_idx + 1) % len(self.current_files)
+        self.current_shard_file = self.current_files[self.current_shard_idx]
+        self.tokens = _load_data_shard(self.current_shard_file)
+        self.current_position = self.process_rank * self.B * self.T
+        # Sanity check
+        print(f"Process {self.process_rank}: Advanced to shard file: {self.current_shard_file}")
+
+    def next_batch(self, iteration=None):
+        if self.num_bins is not None and iteration is not None and self.schedule_func is not None:
+            bin_idx = self.schedule_func(iteration)
+            if bin_idx != self.current_bin_idx:
+                print(f"Process {self.process_rank}: Changing to bin {bin_idx} at iteration {iteration}")
+                self.current_bin_idx = bin_idx
+                self.current_files = self.bin_files[self.current_bin_idx]
+                self.current_shard_idx = 0
+                self.current_shard_file = self.current_files[self.current_shard_idx]
+                self.tokens = _load_data_shard(self.current_shard_file)
+                self.current_position = self.process_rank * self.B * self.T
+                # Sanity check
+                print(f"Process {self.process_rank}: Loaded shard file: {self.current_shard_file}")
+
         B = self.B
         T = self.T
         buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        if len(buf) < B*T+1:
+            # Need to advance to next shard
+            self.advance()
+            buf = self.tokens[self.current_position : self.current_position+B*T+1]
+            # Sanity check
+            if len(buf) < B*T+1:
+                print(f"Process {self.process_rank}: Not enough data in bin {self.current_bin_idx}")
+                self.advance()
+                buf = self.tokens[self.current_position : self.current_position+B*T+1]
+
         buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
         x = (buf[:-1]).view(B, T) # inputs
         y = (buf[1:]).view(B, T) # targets
@@ -395,7 +476,7 @@ class Hyperparameters:
     # optimization hyperparams
     batch_size : int = 8#8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 8 # batch size, in sequences, per device
-    sequence_length : int = 1024 # sequence length, in tokens
+    sequence_length : int = 32 # sequence length, in tokens
     num_iterations : int = 3242 # number of iterations to run
     warmup_iters : int = 0
     warmdown_iters : int = 926 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
@@ -409,6 +490,8 @@ class Hyperparameters:
     wandb_entity: str = None  # Set to your wandb username or team name
     wandb_run_name: str = None  # Will be auto-generated if None
     wandb_log_every: int = 1  # How often to log metrics to wandb
+    test_mode: bool = True  # Enable testing mode with random bin assignments
+
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -449,6 +532,17 @@ result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subproces
 print0(f'{result.stdout}', logonly=True)
 print0('='*100, logonly=True)
 
+# Define the schedule function
+def schedule_func(iteration):
+    # Example: oscillatory schedule
+    import math
+    num_bins = 5  # Number of entropy bins
+    period = args.num_iterations // 2  # Adjust the period as needed
+    bin_idx = int((math.sin(2 * math.pi * iteration / period) + 1) / 2 * (num_bins - 1))
+    bin_idx = max(0, min(bin_idx, num_bins - 1))  # Ensure bin_idx is within valid range
+    return bin_idx
+
+    
 # convenience variables
 B, T = args.device_batch_size, args.sequence_length
 # calculate the number of steps to take in the val loop.
@@ -457,6 +551,23 @@ val_steps = args.val_tokens // (B * T * ddp_world_size)
 # calculate the steps of gradient accumulation required to attain the desired global batch size.
 assert args.batch_size % (B * ddp_world_size) == 0
 train_accumulation_steps = args.batch_size // (B * ddp_world_size)
+
+# Modify the data loaders to include num_bins, schedule_func, and test_mode
+num_bins = 5  # Adjust the number of bins as needed
+train_loader = DistributedDataLoader(
+    args.input_bin, B, T, ddp_rank, ddp_world_size,
+    num_bins=num_bins, schedule_func=schedule_func, test_mode=args.test_mode
+)
+val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+
+print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
+print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+print0('='*100, logonly=True)
+x, y = train_loader.next_batch(iteration=0)  # Pass iteration
+
+
+
+
 
 # load tokens
 train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
@@ -543,7 +654,7 @@ train_loader.reset()
 
 for step in range(args.num_iterations + 1):
     last_step = (step == args.num_iterations)
-    
+
     if step == 10:
         training_time_ms = 0
         t0 = time.time()
@@ -592,9 +703,9 @@ for step in range(args.num_iterations + 1):
     # Training section
     model.train()
     for i in range(1, train_accumulation_steps+1):
+        x, y = train_loader.next_batch(iteration=step)
         loss = model(x, y)
         train_loss = loss.detach()
-        x, y = train_loader.next_batch()
         
         if i < train_accumulation_steps:
             with model.no_sync():
