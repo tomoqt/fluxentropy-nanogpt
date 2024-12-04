@@ -3,4 +3,4 @@ pylog124M/
 __pycache__/
 logs/
 venv
-wandb/
+wandb

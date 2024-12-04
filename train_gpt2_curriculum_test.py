@@ -1,6 +1,7 @@
 import os
 import sys
 import wandb
+import subprocess
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import uuid
@@ -15,16 +16,46 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
-# Use of FlexAttention contributed by @KoszarskyB
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-flex_attention = torch.compile(flex_attention, dynamic=False)
-create_block_mask = torch.compile(create_block_mask, dynamic=False)
+
+# Add this near the top of the file, after imports
+DEBUG_CURRICULUM = True  # Easy to disable by setting to False
+
 # -----------------------------------------------------------------------------
 # Muon optimizer
+def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
+        is_causal=False, scale=None, enable_gqa=False) -> torch.Tensor:
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+    
+    # Create attn_bias on the same device as query
+    attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
+    
+    if is_causal:
+        assert attn_mask is None
+        # Create mask on the same device as query
+        temp_mask = torch.ones(L, S, dtype=torch.bool, device=query.device).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+        attn_bias = attn_bias.to(query.dtype)
 
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias += attn_mask
+
+    if enable_gqa:
+        key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
+        value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
+
+    attn_weight = query @ key.transpose(-2, -1) * scale_factor
+    attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    return attn_weight @ value
 def zeropower_via_svd(G, steps=None):
     U, S, V = G.svd()
     return U @ V.T
+
 @torch.compile
 def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     r"""
@@ -124,22 +155,13 @@ class Muon(torch.optim.Optimizer):
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
-def norm(x):
-    return F.rms_norm(x, (x.size(-1),))
-
-class CastedLinear(nn.Linear):
-
-    def __init__(self, in_features, out_features):
-        super().__init__(in_features, out_features, bias=False)
-
-    def forward(self, x):
-        return F.linear(x, self.weight.to(x.dtype))
-
 class Rotary(torch.nn.Module):
 
     def __init__(self, dim, base=10000):
         super().__init__()
-        self.register_buffer('inv_freq', (1 / base) ** (torch.arange(0, dim, 2) / dim))
+        self.dim = dim
+        self.base = base
+        self.inv_freq = None
         self.seq_len_cached = None
         self.cos_cached = None
         self.sin_cached = None
@@ -147,57 +169,86 @@ class Rotary(torch.nn.Module):
     def forward(self, x):
         seq_len = x.shape[1]
         if seq_len != self.seq_len_cached:
-            t = torch.arange(seq_len, device=x.device)
-            freqs = torch.outer(t, self.inv_freq)
+            self.inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=x.device).float() / self.dim))
             self.seq_len_cached = seq_len
-            self.cos_cached = freqs.cos()
-            self.sin_cached = freqs.sin()
-        cos, sin = self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
-        # apply_rotary_emb(x, cos, sin)
-        x1, x2 = x.chunk(2, dim=3)
-        y1 = x1 * cos + x2 * sin
-        y2 = x1 * (-sin) + x2 * cos
-        return torch.cat((y1, y2), 3).type_as(x)
+            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+            freqs = torch.outer(t, self.inv_freq)
+            self.cos_cached = freqs.cos().to(torch.float16)
+            self.sin_cached = freqs.sin().to(torch.float16)
+        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+
+def apply_rotary_emb(x, cos, sin):
+    assert x.ndim == 4 # multihead attention
+    d = x.shape[3]//2
+    x1 = x[..., :d]
+    x2 = x[..., d:]
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat([y1, y2], 3).type_as(x)
+
+class CastedLinear(nn.Linear):
+    def forward(self, x):
+        return F.linear(x, self.weight.to(x.dtype))
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, dim, n_head):
+    def __init__(self, config):
         super().__init__()
-        assert dim % n_head == 0
-        self.n_head = n_head
-        self.c_q = CastedLinear(dim, dim)
-        self.c_k = CastedLinear(dim, dim)
-        self.c_v = CastedLinear(dim, dim)
-        # value residual lambda
-        self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
-        # rotary embeddings
-        self.rotary = Rotary(dim // n_head) # dim // n_head = head_dim
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        assert self.n_embd % self.n_head == 0
+        self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_v = CastedLinear(self.n_embd, self.n_embd, bias=False)
         # output projection
-        self.c_proj = CastedLinear(dim, dim)
+        self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        self.rotary = Rotary(self.head_dim)
+        self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
 
-    def forward(self, x, v1, block_mask):
-        B, T = x.size(0), x.size(1) # batch size, sequence length
-        assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q = self.c_q(x).view(B, T, self.n_head, -1)
-        k = self.c_k(x).view(B, T, self.n_head, -1)
-        v = self.c_v(x).view(B, T, self.n_head, -1)
+    def forward(self, x, v1=None):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
         if v1 is None:
             v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
         v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
-        q, k = norm(q), norm(k) # QK norm suggested by @Grad62304977
-        q, k = self.rotary(q), self.rotary(k)
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
+        cos, sin = self.rotary(q)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        y = scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+
+        '''
+        # Replace scaled_dot_product_attention with manual implementation
+        scale = 1.0 / math.sqrt(self.head_dim)
+        q = q.transpose(1, 2)  # (B, nh, T, hs)
+        k = k.transpose(1, 2)  # (B, nh, T, hs)
+        v = v.transpose(1, 2)  # (B, nh, T, hs)
+        
+        # compute attention scores
+        att = (q @ k.transpose(-2, -1)) * scale
+        
+        # causal mask
+        causal_mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        att = att.masked_fill(causal_mask, float('-inf'))
+        
+        # softmax
+        att = F.softmax(att, dim=-1)
+        
+        y = att @ v  # (B, nh, T, hs)
+   '''     
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y, v1
 
 class MLP(nn.Module):
 
-    def __init__(self, dim):
+    def __init__(self, config):
         super().__init__()
-        self.c_fc   = CastedLinear(dim, 4 * dim)
-        self.c_proj = CastedLinear(4 * dim, dim)
+        self.c_fc    = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x):
@@ -210,15 +261,15 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.attn = CausalSelfAttention(config.n_embd, config.n_head)
-        self.mlp = MLP(config.n_embd)
+        self.attn = CausalSelfAttention(config)
+        self.mlp = MLP(config)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def forward(self, x, v1, x0, block_mask):
+    def forward(self, x, v1, x0):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x1, v1 = self.attn(norm(x), v1, block_mask)
+        x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1)
         x = x + x1
-        x = x + self.mlp(norm(x))
+        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
         return x, v1
 
 # -----------------------------------------------------------------------------
@@ -235,55 +286,30 @@ class GPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-
-        # U-net design by @brendanh0gan
-        self.num_encoder_layers = config.n_layer // 2 # Half of the layers for encoder
-        self.num_decoder_layers = config.n_layer - self.num_encoder_layers # Remaining for decoder
-        # Add learnable skip connection weights for decoder layers
-        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
+        self.config = config
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
-        self.lm_head = CastedLinear(config.n_embd, config.vocab_size)
+        self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
-    def forward(self, idx, target, attn_blocksize):
-
-        docs = (idx == 50256).cumsum(0)
-        def document_causal_mask(b, h, q_idx, kv_idx):
-          causal_mask = q_idx >= kv_idx
-          document_mask = docs[q_idx] == docs[kv_idx]
-          window_mask = q_idx - kv_idx < attn_blocksize
-          return causal_mask & document_mask & window_mask
-
-        S = len(idx)
-        block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=True)
-
+    def forward(self, idx, target, attn_blocksize=None):
         # forward the GPT model itself
-        x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
-        x = norm(x) # @Grad62304977
+        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        x = F.rms_norm(x, (x.size(-1),)) # @Grad62304977
         x0 = x
         v1 = None
+        for block in self.transformer.h:
+            x, v1 = block(x, v1, x0)
+        x = F.rms_norm(x, (x.size(-1),))
 
-        # Store outputs for U-Net skip connections
-        skip_connections = []
-        # Encoder pass - process only the first half of the blocks
-        for i in range(self.num_encoder_layers):
-            x, v1 = self.transformer.h[i](x, v1, x0, block_mask)
-            skip_connections.append(x)
-        # Decoder pass - process the remaining blocks with weighted skip connections
-        for i in range(self.num_decoder_layers):
-            x = x + self.skip_weights[i] * skip_connections.pop()
-            x, v1 = self.transformer.h[self.num_encoder_layers + i](x, v1, x0, block_mask)
-
-        x = norm(x)
         logits = self.lm_head(x)
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
-        return loss
+        return loss.float()
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -416,8 +442,16 @@ class DistributedDataLoader:
                 self.current_shard_file = self.current_files[self.current_shard_idx]
                 self.tokens = _load_data_shard(self.current_shard_file)
                 self.current_position = self.process_rank * self.B * self.T
-                # Sanity check
-                print(f"Process {self.process_rank}: Loaded shard file: {self.current_shard_file}")
+                
+                # Debug print for curriculum samples
+                if DEBUG_CURRICULUM and self.process_rank == 0:  # Only print from rank 0
+                    print("\n" + "="*50)
+                    print(f"CURRICULUM DEBUG - Bin {bin_idx} Sample:")
+                    sample_start = self.current_position
+                    sample_size = min(50, self.B * self.T)  # Show first 50 tokens or less
+                    sample_tokens = self.tokens[sample_start:sample_start + sample_size]
+                    print(f"First {sample_size} tokens: {sample_tokens}")
+                    print("="*50 + "\n")
 
         B = self.B
         T = self.T
@@ -447,24 +481,30 @@ class DistributedDataLoader:
 @dataclass
 class Hyperparameters:
     # data hyperparams
-    input_bin : str = 'data/sortedfineweb10B/bucket_*.bin' # input .bin to train on
-    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    input_bin : str = 'data/sorted/bucket_*.bin' # updated path pattern to match sorted buckets
+    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin'
     # optimization hyperparams
     batch_size : int = 8
-    sequence_length : int = 64*1024
-    num_iterations : int = 1750
+    device_batch_size : int = 8
+    sequence_length : int = 32
+    num_iterations : int = 3242
     warmup_iters : int = 0
-    cooldown_iters : int = 640
+    warmdown_iters : int = 926
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125
     val_tokens : int = 10485760
     save_every : int = 0
+    # wandb config parameters
+    wandb_project: str = "nanogpt-training"
+    wandb_entity: str = None
+    wandb_run_name: str = None
+    wandb_log_every: int = 1
     test_mode: bool = False  # Disabled test mode for actual curriculum learning
 
 args = Hyperparameters()
 
-# set up DDP (distributed data parallel). torchrun sets this env variable
+# set up DDP (distributed data parallel)
 assert torch.cuda.is_available()
 dist.init_process_group(backend='nccl')
 ddp_rank = int(os.environ['RANK'])
@@ -473,7 +513,7 @@ ddp_world_size = int(os.environ['WORLD_SIZE'])
 device = f'cuda:{ddp_local_rank}'
 torch.cuda.set_device(device)
 print(f"using device: {device}")
-master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
+master_process = (ddp_rank == 0)
 
 # begin logging
 logfile = None
@@ -482,33 +522,36 @@ if master_process:
     logdir = 'logs/%s/' % run_id
     os.makedirs(logdir, exist_ok=True)
     logfile = 'logs/%s.txt' % run_id
-    # create the log file
     with open(logfile, "w") as f:
-        # begin the log by printing this file (the Python code)
         f.write('='*100 + '\n')
         f.write(code)
         f.write('='*100 + '\n')
+
 def print0(s, logonly=False):
     if master_process:
         with open(logfile, "a") as f:
             if not logonly:
                 print(s)
             f.write(s+'\n')
-# log information about the hardware/software environment this is running on
-# and print the full `nvidia-smi` to file
+
+# log hardware/software environment
 print0(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:")
-import subprocess
 result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 print0(f'{result.stdout}', logonly=True)
 print0('='*100, logonly=True)
 
-# Define the schedule function
+# convenience variables 
+B, T = args.device_batch_size, args.sequence_length
+val_steps = args.val_tokens // (B * T * ddp_world_size)
+train_accumulation_steps = args.batch_size // (B * ddp_world_size)
+
+# Define curriculum schedule function
 def schedule_func(iteration):
     """
     Curriculum learning schedule that progresses through bins in order.
     Starts with easier examples (lower numbered bins) and gradually moves to harder ones.
     """
-    num_bins = 6  # Assuming 5 difficulty levels/buckets
+    num_bins = 5  # Assuming 5 difficulty levels/buckets
     progress = iteration / args.num_iterations  # Training progress from 0 to 1
     
     # Linear progression through bins
@@ -516,40 +559,21 @@ def schedule_func(iteration):
     # Clamp to valid range
     return max(0, min(bin_idx, num_bins - 1))
 
-    
-# convenience variables
-B, T = args.device_batch_size, args.sequence_length
-# calculate the number of steps to take in the val loop.
-assert args.val_tokens % (B * T * ddp_world_size) == 0
-val_steps = args.val_tokens // (B * T * ddp_world_size)
-# calculate the steps of gradient accumulation required to attain the desired global batch size.
-assert args.batch_size % (B * ddp_world_size) == 0
-train_accumulation_steps = args.batch_size // (B * ddp_world_size)
-
-# Modify the data loaders to include num_bins, schedule_func, and test_mode
-num_bins = 5  # Adjust the number of bins as needed
+# Initialize data loaders with curriculum learning support
 train_loader = DistributedDataLoader(
     args.input_bin, B, T, ddp_rank, ddp_world_size,
-    num_bins=num_bins, schedule_func=schedule_func, test_mode=args.test_mode
+    num_bins=5,  # Set to match the number of bucket files
+    schedule_func=schedule_func,
+    test_mode=args.test_mode  # Now False
 )
 val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
 
 print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
 print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
 print0('='*100, logonly=True)
-x, y = train_loader.next_batch(iteration=0)  # Pass iteration
 
-
-
-
-
-# load tokens
-train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
-print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
-print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
-print0('='*100, logonly=True)
-x, y = train_loader.next_batch()
+# Initialize first batch
+x, y = train_loader.next_batch(iteration=0)
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
@@ -645,7 +669,7 @@ for step in range(args.num_iterations + 1):
         for _ in range(val_steps):
             with torch.no_grad():
                 x_val, y_val = val_loader.next_batch()
-                val_loss += model(x_val, y_val)
+                val_loss += model(x_val, y_val, attn_blocksize=args.sequence_length)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         
@@ -678,7 +702,7 @@ for step in range(args.num_iterations + 1):
     model.train()
     for i in range(1, train_accumulation_steps+1):
         x, y = train_loader.next_batch(iteration=step)
-        loss = model(x, y)
+        loss = model(x, y, attn_blocksize=args.sequence_length)
         train_loss = loss.detach()
         
         if i < train_accumulation_steps:
