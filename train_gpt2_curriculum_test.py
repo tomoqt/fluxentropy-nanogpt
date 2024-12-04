@@ -16,6 +16,8 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
+import logging
+logging.basicConfig(level=logging.INFO)
 
 # Add this near the top of the file, after imports
 DEBUG_CURRICULUM = True  # Easy to disable by setting to False
@@ -462,17 +464,20 @@ class DistributedDataLoader:
             buf = self.tokens[self.current_position : self.current_position+B*T+1]
             # Sanity check
             if len(buf) < B*T+1:
-                print(f"Process {self.process_rank}: Not enough data in bin {self.current_bin_idx}")
-                self.advance()
-                buf = self.tokens[self.current_position : self.current_position+B*T+1]
+                raise RuntimeError(f"Not enough data in bin {self.current_bin_idx} after advancing")
+
+        # Validate token values
+        if np.min(buf) < 0 or np.max(buf) >= 50304:  # GPT-2 vocab size
+            raise ValueError(f"Invalid token values found: min={np.min(buf)}, max={np.max(buf)}")
 
         buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
-        x = (buf[:-1]).view(B, T) # inputs
-        y = (buf[1:]).view(B, T) # targets
-        # advance current position and load next shard if necessary
+        x = (buf[:-1]).view(B, T)
+        y = (buf[1:]).view(B, T)
+        
         self.current_position += B * T * self.num_processes
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.advance()
+        
         return x.cuda(), y.cuda()
 
 # -----------------------------------------------------------------------------
@@ -650,6 +655,23 @@ torch.cuda.synchronize()
 t0 = time.time()
 train_loader.reset()
 
+def validate_model_inputs(x, y):
+    """Validate input tensors before processing"""
+    if x is None or y is None:
+        raise ValueError("Input tensors cannot be None")
+    
+    if not torch.isfinite(x).all():
+        raise ValueError("Input tensor x contains nan or inf values")
+    
+    if not torch.isfinite(y).all():
+        raise ValueError("Target tensor y contains nan or inf values")
+    
+    if x.max() >= num_vocab or x.min() < 0:
+        raise ValueError(f"Input tensor contains invalid token ids: min={x.min()}, max={x.max()}, vocab_size={num_vocab}")
+    
+    if y.max() >= num_vocab or y.min() < 0:
+        raise ValueError(f"Target tensor contains invalid token ids: min={y.min()}, max={y.max()}, vocab_size={num_vocab}")
+
 for step in range(args.num_iterations + 1):
     last_step = (step == args.num_iterations)
 
@@ -701,15 +723,34 @@ for step in range(args.num_iterations + 1):
     # Training section
     model.train()
     for i in range(1, train_accumulation_steps+1):
-        x, y = train_loader.next_batch(iteration=step)
-        loss = model(x, y, attn_blocksize=args.sequence_length)
-        train_loss = loss.detach()
-        
-        if i < train_accumulation_steps:
-            with model.no_sync():
-                loss.backward()
-        else:
-            loss.backward()
+        try:
+            x, y = train_loader.next_batch(iteration=step)
+            
+            # Add validation
+            validate_model_inputs(x, y)
+            
+            # Add debugging info
+            if ddp_rank == 0 and step == 0:
+                logging.info(f"Input tensor shape: {x.shape}, dtype: {x.dtype}")
+                logging.info(f"Target tensor shape: {y.shape}, dtype: {y.dtype}")
+                logging.info(f"Input tensor range: min={x.min()}, max={x.max()}")
+                logging.info(f"Target tensor range: min={y.min()}, max={y.max()}")
+            
+            # Enable CUDA error checking during development
+            with torch.cuda.amp.autocast(enabled=True):
+                loss = model(x, y, attn_blocksize=args.sequence_length)
+                train_loss = loss.detach()
+                
+                if i < train_accumulation_steps:
+                    with model.no_sync():
+                        loss.backward()
+                else:
+                    loss.backward()
+                
+        except RuntimeError as e:
+            logging.error(f"Error during training step {step}: {str(e)}")
+            logging.error(f"Device: {device}, Rank: {ddp_rank}")
+            raise
     
     # momentum warmup for Muon
     frac = min(step/500, 1)
