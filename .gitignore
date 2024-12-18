@@ -1,0 +1,12 @@
+fineweb10B/
+pylog124M/
+__pycache__/
+logs/
+venv
+wandb
+data/fineweb10B-gpt2-fluxentropy
+data/dataset_cache
+data/sorted/
+data/sorted_old/
+data/sorted
+data/sorted_old
